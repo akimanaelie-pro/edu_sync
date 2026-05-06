@@ -1,0 +1,751 @@
+<?php
+header('Content-Type: application/json');
+header('Access-Control-Allow-Origin: *');
+header('Access-Control-Allow-Methods: GET, POST, PUT, DELETE');
+header('Access-Control-Allow-Headers: Content-Type, Authorization');
+
+require_once __DIR__ . '/../config/config.php';
+require_once __DIR__ . '/../config/database.php';
+
+$method = $_SERVER['REQUEST_METHOD'];
+$endpoint = $_GET['action'] ?? $_GET['endpoint'] ?? '';
+
+$db = db();
+
+if ($method === 'OPTIONS') {
+    exit;
+}
+
+function authenticate() {
+    $headers = getallheaders();
+    $token = $headers['Authorization'] ?? $headers['Authorization'] ?? '';
+    
+    if (!$token) {
+        http_response_code(401);
+        echo json_encode(['error' => 'Unauthorized']);
+        exit;
+    }
+    
+    $parts = explode(' ', $token);
+    if (count($parts) !== 2 || $parts[0] !== 'Bearer') {
+        http_response_code(401);
+        echo json_encode(['error' => 'Invalid token format']);
+        exit;
+    }
+    
+    $userId = (int)$parts[1];
+    $user = $db->selectOne("SELECT * FROM users WHERE id = ?", [$userId]);
+    
+    if (!$user) {
+        http_response_code(401);
+        echo json_encode(['error' => 'User not found']);
+        exit;
+    }
+    
+    return $user;
+}
+
+if ($endpoint === 'students') {
+    if ($method === 'GET') {
+        $students = $db->select("
+            SELECT s.*, u.first_name, u.last_name, u.email, u.phone, c.name as class_name
+            FROM students s
+            JOIN users u ON s.user_id = u.id
+            LEFT JOIN classes c ON s.class_id = c.id
+            LIMIT 100
+        ");
+        echo json_encode(['success' => true, 'data' => $students]);
+    }
+}
+
+if ($endpoint === 'attendance') {
+    if ($method === 'GET') {
+        $date = $_GET['date'] ?? date('Y-m-d');
+        $classId = $_GET['class_id'] ?? '';
+        
+        $where = "a.date = ?";
+        $params = [$date];
+        
+        if ($classId) {
+            $where .= " AND a.class_id = ?";
+            $params[] = $classId;
+        }
+        
+        $attendance = $db->select("
+            SELECT a.*, u.first_name, u.last_name, s.student_id
+            FROM attendance a
+            JOIN students s ON a.student_id = s.id
+            JOIN users u ON s.user_id = u.id
+            WHERE $where
+        ", $params);
+        
+        echo json_encode(['success' => true, 'data' => $attendance]);
+    }
+    
+    if ($method === 'POST') {
+        $data = json_decode(file_get_contents('php://input'), true);
+        
+        $db->insert('attendance', [
+            'uuid' => generateUUID(),
+            'student_id' => $data['student_id'],
+            'class_id' => $data['class_id'],
+            'date' => $data['date'],
+            'status' => $data['status'],
+            'mark_by' => $data['user_id'],
+            'mark_method' => $data['method'] ?? 'manual',
+            'notes' => $data['notes'] ?? '',
+            'sync_status' => 'pending'
+        ]);
+        
+        echo json_encode(['success' => true, 'message' => 'Attendance marked']);
+    }
+}
+
+if ($endpoint === 'grades') {
+    if ($method === 'GET') {
+        $studentId = $_GET['student_id'] ?? '';
+        $subjectId = $_GET['subject_id'] ?? '';
+        
+        $where = "1=1";
+        $params = [];
+        
+        if ($studentId) {
+            $where .= " AND g.student_id = ?";
+            $params[] = $studentId;
+        }
+        
+        if ($subjectId) {
+            $where .= " AND g.subject_id = ?";
+            $params[] = $subjectId;
+        }
+        
+        $grades = $db->select("
+            SELECT g.*, sub.name as subject_name
+            FROM grades g
+            JOIN subjects sub ON g.subject_id = sub.id
+            WHERE $where
+            ORDER BY g.created_at DESC
+        ", $params);
+        
+        echo json_encode(['success' => true, 'data' => $grades]);
+    }
+}
+
+if ($endpoint === 'fees') {
+    if ($method === 'GET') {
+        $studentId = $_GET['student_id'] ?? '';
+        
+        $fees = $db->select("
+            SELECT fs.*, 
+                   (SELECT SUM(amount) FROM fee_payments WHERE student_id = ? AND fee_id = fs.id AND status = 'completed') as paid
+            FROM fee_structure fs
+            WHERE fs.academic_year = ?
+        ", [$studentId ?: 0, getAcademicYear()]);
+        
+        echo json_encode(['success' => true, 'data' => $fees]);
+    }
+}
+
+if ($endpoint === 'timetable') {
+    if ($method === 'GET') {
+        $classId = $_GET['class_id'] ?? '';
+        $day = $_GET['day'] ?? '';
+        
+        $where = "1=1";
+        $params = [];
+        
+        if ($classId) {
+            $where .= " AND t.class_id = ?";
+            $params[] = $classId;
+        }
+        
+        if ($day) {
+            $where .= " AND t.day_of_week = ?";
+            $params[] = $day;
+        }
+        
+        $timetable = $db->select("
+            SELECT t.*, sub.name as subject_name, u.first_name, u.last_name
+            FROM timetable t
+            JOIN subjects sub ON t.subject_id = sub.id
+            JOIN teachers tea ON t.teacher_id = tea.id
+            JOIN users u ON tea.user_id = u.id
+            WHERE $where
+            ORDER BY t.start_time
+        ", $params);
+        
+        echo json_encode(['success' => true, 'data' => $timetable]);
+    }
+}
+
+if ($endpoint === 'messages') {
+    $user = authenticate();
+    
+    if ($method === 'GET') {
+        $messages = $db->select("
+            SELECT m.*, u.first_name, u.last_name as sender_name
+            FROM messages m
+            JOIN users u ON m.sender_id = u.id
+            WHERE m.receiver_id = ?
+            ORDER BY m.created_at DESC
+            LIMIT 50
+        ", [$user['id']]);
+        
+        echo json_encode(['success' => true, 'data' => $messages]);
+    }
+    
+    if ($method === 'POST') {
+        $data = json_decode(file_get_contents('php://input'), true);
+        
+        $db->insert('messages', [
+            'uuid' => generateUUID(),
+            'sender_id' => $user['id'],
+            'receiver_id' => $data['receiver_id'],
+            'subject' => $data['subject'] ?? '',
+            'message' => $data['message'],
+            'message_type' => 'direct',
+            'sync_status' => 'pending'
+        ]);
+        
+        echo json_encode(['success' => true, 'message' => 'Message sent']);
+    }
+}
+
+if ($endpoint === 'profile') {
+    $user = authenticate();
+    
+    if ($method === 'GET') {
+        if ($user['role'] === 'student') {
+            $profile = $db->selectOne("
+                SELECT s.*, u.first_name, u.last_name, u.email, u.phone, c.name as class_name
+                FROM students s
+                JOIN users u ON s.user_id = u.id
+                LEFT JOIN classes c ON s.class_id = c.id
+                WHERE u.id = ?
+            ", [$user['id']]);
+        } else {
+            $profile = $user;
+        }
+        
+        echo json_encode(['success' => true, 'data' => $profile]);
+    }
+}
+
+if ($endpoint === 'stats') {
+    $user = authenticate();
+    
+    $stats = [
+        'total_students' => $db->count('students', '1=1'),
+        'total_teachers' => $db->count('teachers', '1=1'),
+        'total_classes' => $db->count('classes', '1=1'),
+        'today_attendance' => $db->selectOne("
+            SELECT (SUM(CASE WHEN status = 'present' THEN 1 ELSE 0 END) / COUNT(*)) * 100 as rate
+            FROM attendance WHERE date = CURDATE()
+        ")['rate'] ?? 0
+    ];
+    
+    echo json_encode(['success' => true, 'data' => $stats]);
+}
+
+// Quick Add Teacher
+if ($endpoint === 'quick_add_teacher' && $method === 'POST') {
+    $email = $_POST['email'] ?? '';
+    $firstName = $_POST['first_name'] ?? '';
+    $lastName = $_POST['last_name'] ?? '';
+    $phone = $_POST['phone'] ?? '';
+    $department = $_POST['department'] ?? '';
+    $qualification = $_POST['qualification'] ?? '';
+    $password = $_POST['password'] ?? 'teacher123';
+    
+    if (!$email || !$firstName || !$lastName) {
+        echo json_encode(['success' => false, 'message' => 'Email and name are required']);
+        exit;
+    }
+    
+    if ($db->exists('users', 'email = ?', [$email])) {
+        echo json_encode(['success' => false, 'message' => 'Email already exists']);
+        exit;
+    }
+    
+    $userId = $db->insert('users', [
+        'uuid' => generateUUID(),
+        'email' => $email,
+        'password_hash' => password_hash($password, PASSWORD_DEFAULT),
+        'role' => 'teacher',
+        'first_name' => $firstName,
+        'last_name' => $lastName,
+        'phone' => $phone,
+        'sync_status' => 'pending'
+    ]);
+    
+    $db->insert('teachers', [
+        'uuid' => generateUUID(),
+        'user_id' => $userId,
+        'employee_id' => 'T' . str_pad($db->count('teachers') + 1, 4, '0', STR_PAD_LEFT),
+        'department' => $department,
+        'qualification' => $qualification,
+        'hire_date' => date('Y-m-d'),
+        'sync_status' => 'pending'
+    ]);
+    
+    echo json_encode(['success' => true, 'message' => 'Teacher added successfully']);
+}
+
+// Quick Add Student
+if ($endpoint === 'quick_add_student' && $method === 'POST') {
+    $firstName = $_POST['first_name'] ?? '';
+    $lastName = $_POST['last_name'] ?? '';
+    $email = $_POST['email'] ?? $firstName . strtolower($lastName) . '@student.edu';
+    $phone = $_POST['phone'] ?? '';
+    $gender = $_POST['gender'] ?? 'male';
+    $dob = $_POST['date_of_birth'] ?? '2010-01-01';
+    $classId = $_POST['class_id'] ?? null;
+    
+    if (!$firstName || !$lastName) {
+        echo json_encode(['success' => false, 'message' => 'Name is required']);
+        exit;
+    }
+    
+    $userId = $db->insert('users', [
+        'uuid' => generateUUID(),
+        'email' => $email,
+        'password_hash' => password_hash('student123', PASSWORD_DEFAULT),
+        'role' => 'student',
+        'first_name' => $firstName,
+        'last_name' => $lastName,
+        'phone' => $phone,
+        'sync_status' => 'pending'
+    ]);
+    
+    $db->insert('students', [
+        'uuid' => generateUUID(),
+        'user_id' => $userId,
+        'student_id' => 'ST' . str_pad($db->count('students') + 1, 5, '0', STR_PAD_LEFT),
+        'admission_date' => date('Y-m-d'),
+        'date_of_birth' => $dob,
+        'gender' => $gender,
+        'class_id' => $classId,
+        'sync_status' => 'pending'
+    ]);
+    
+    echo json_encode(['success' => true, 'message' => 'Student added successfully']);
+}
+
+// Quick Add Class
+if ($endpoint === 'quick_add_class' && $method === 'POST') {
+    $name = $_POST['name'] ?? '';
+    $gradeLevel = $_POST['grade_level'] ?? '';
+    $roomNumber = $_POST['room_number'] ?? '';
+    $capacity = $_POST['capacity'] ?? 40;
+    
+    if (!$name) {
+        echo json_encode(['success' => false, 'message' => 'Class name is required']);
+        exit;
+    }
+    
+    $db->insert('classes', [
+        'uuid' => generateUUID(),
+        'name' => $name,
+        'grade_level' => $gradeLevel,
+        'room_number' => $roomNumber,
+        'capacity' => $capacity,
+        'academic_year' => getAcademicYear(),
+        'sync_status' => 'pending'
+    ]);
+    
+    echo json_encode(['success' => true, 'message' => 'Class added successfully']);
+}
+
+// Quick Add Subject
+if ($endpoint === 'quick_add_subject' && $method === 'POST') {
+    $name = $_POST['name'] ?? '';
+    $code = $_POST['code'] ?? '';
+    $classId = $_POST['class_id'] ?? null;
+    $teacherId = $_POST['teacher_id'] ?? null;
+    $creditHours = $_POST['credit_hours'] ?? 1;
+    
+    if (!$name) {
+        echo json_encode(['success' => false, 'message' => 'Subject name is required']);
+        exit;
+    }
+    
+    $db->insert('subjects', [
+        'uuid' => generateUUID(),
+        'name' => $name,
+        'code' => $code,
+        'class_id' => $classId,
+        'teacher_id' => $teacherId,
+        'credit_hours' => $creditHours,
+        'sync_status' => 'pending'
+    ]);
+    
+    echo json_encode(['success' => true, 'message' => 'Subject added successfully']);
+}
+
+// Get Classes for dropdown
+if ($endpoint === 'get_classes' && $method === 'GET') {
+    $classes = $db->select("SELECT * FROM classes ORDER BY name");
+    echo json_encode(['success' => true, 'data' => $classes]);
+}
+
+// Get Teachers for dropdown
+if ($endpoint === 'get_teachers' && $method === 'GET') {
+    $teachers = $db->select("
+        SELECT t.*, u.first_name, u.last_name 
+        FROM teachers t 
+        JOIN users u ON t.user_id = u.id 
+        ORDER BY u.first_name
+    ");
+    echo json_encode(['success' => true, 'data' => $teachers]);
+}
+
+// Delete Class
+if ($endpoint === 'delete_class') {
+    $id = (int)($_GET['id'] ?? $_POST['id'] ?? 0);
+    
+    if (!$id) {
+        echo json_encode(['success' => false, 'message' => 'Invalid ID']);
+        exit;
+    }
+    
+    try {
+        $pdo = $db->getConnection();
+        $stmt = $pdo->prepare("DELETE FROM classes WHERE id = ?");
+        $stmt->execute([$id]);
+        echo json_encode(['success' => true, 'message' => 'Deleted']);
+    } catch (Exception $e) {
+        echo json_encode(['success' => false, 'message' => $e->getMessage()]);
+    }
+    exit;
+}
+
+// Update Class
+if ($endpoint === 'update_class' && $method === 'POST') {
+    $id = (int)($_POST['id'] ?? 0);
+    
+    if (!$id) {
+        echo json_encode(['success' => false, 'message' => 'Invalid ID']);
+        exit;
+    }
+    
+    $db->update('classes', [
+        'name' => $_POST['name'] ?? '',
+        'grade_level' => $_POST['grade_level'] ?? '',
+        'capacity' => (int)($_POST['capacity'] ?? 40),
+        'room_number' => $_POST['room_number'] ?? '',
+        'sync_status' => 'pending'
+    ], 'id = :id', ['id' => $id]);
+    
+    echo json_encode(['success' => true, 'message' => 'Class updated']);
+}
+
+// Assign Student to Class
+if ($endpoint === 'assign_student_class' && $method === 'POST') {
+    $studentId = (int)($_POST['student_id'] ?? 0);
+    $classId = (int)($_POST['class_id'] ?? 0);
+    
+    if (!$studentId || !$classId) {
+        echo json_encode(['success' => false, 'message' => 'Invalid student or class']);
+        exit;
+    }
+    
+    $db->update('students', [
+        'class_id' => $classId,
+        'sync_status' => 'pending'
+    ], 'id = :id', ['id' => $studentId]);
+    
+    echo json_encode(['success' => true, 'message' => 'Student added to class']);
+}
+
+// Remove Student from Class
+if ($endpoint === 'remove_student_class' && $method === 'POST') {
+    $studentId = (int)($_GET['id'] ?? 0);
+    
+    if (!$studentId) {
+        echo json_encode(['success' => false, 'message' => 'Invalid student ID']);
+        exit;
+    }
+    
+    $db->update('students', [
+        'class_id' => null,
+        'sync_status' => 'pending'
+    ], 'id = :id', ['id' => $studentId]);
+    
+    echo json_encode(['success' => true, 'message' => 'Student removed from class']);
+}
+
+// Delete Student
+if ($endpoint === 'delete_student') {
+    $studentId = (int)($_GET['id'] ?? 0);
+    
+    if (!$studentId) {
+        echo json_encode(['success' => false, 'message' => 'Invalid student ID']);
+        exit;
+    }
+    
+    $student = $db->selectOne("SELECT user_id FROM students WHERE id = ?", [$studentId]);
+    
+    if (!$student) {
+        echo json_encode(['success' => false, 'message' => 'Student not found']);
+        exit;
+    }
+    
+    $db->delete('students', 'id = :id', ['id' => $studentId]);
+    $db->delete('users', 'id = :id', ['id' => $student['user_id']]);
+    
+    echo json_encode(['success' => true, 'message' => 'Student deleted']);
+}
+
+// Create Teacher with Profile Image
+if ($endpoint === 'create_teacher' && $method === 'POST') {
+    if ($db->exists('users', 'email = ?', [$_POST['email']])) {
+        echo json_encode(['success' => false, 'message' => 'Email already exists']);
+        exit;
+    }
+    
+    $uuid = generateUUID();
+    $passwordHash = password_hash($_POST['password'] ?? 'teacher123', PASSWORD_DEFAULT);
+    
+    $profileImagePath = null;
+    if (isset($_FILES['profile_image']) && $_FILES['profile_image']['error'] === 0) {
+        $uploadDir = __DIR__ . '/../uploads/profiles/';
+        if (!is_dir($uploadDir)) {
+            mkdir($uploadDir, 0755, true);
+        }
+        $extension = pathinfo($_FILES['profile_image']['name'], PATHINFO_EXTENSION);
+        $filename = 'teacher_' . time() . '.' . $extension;
+        $targetPath = $uploadDir . $filename;
+        if (move_uploaded_file($_FILES['profile_image']['tmp_name'], $targetPath)) {
+            $profileImagePath = 'uploads/profiles/' . $filename;
+        }
+    }
+    
+    $userData = [
+        'uuid' => $uuid,
+        'email' => $_POST['email'],
+        'password_hash' => $passwordHash,
+        'role' => 'teacher',
+        'first_name' => $_POST['first_name'],
+        'last_name' => $_POST['last_name'],
+        'phone' => $_POST['phone'] ?? null,
+        'sync_status' => 'pending'
+    ];
+    
+    if ($profileImagePath) {
+        $userData['profile_image'] = $profileImagePath;
+    }
+    
+    $userId = $db->insert('users', $userData);
+    
+    if ($userId) {
+        $db->insert('teachers', [
+            'uuid' => generateUUID(),
+            'user_id' => $userId,
+            'employee_id' => 'EMP' . date('Y') . str_pad($db->count('teachers', '1=1') + 1, 4, '0', STR_PAD_LEFT),
+            'department' => $_POST['department'] ?? '',
+            'qualification' => $_POST['qualification'] ?? '',
+            'hire_date' => $_POST['hire_date'] ?? date('Y-m-d'),
+            'sync_status' => 'pending'
+        ]);
+        echo json_encode(['success' => true, 'message' => 'Teacher created successfully']);
+    } else {
+        echo json_encode(['success' => false, 'message' => 'Failed to create teacher']);
+    }
+    exit;
+}
+
+// Create Student with Profile Image
+if ($endpoint === 'create_student' && $method === 'POST') {
+    if ($db->exists('users', 'email = ?', [$_POST['email']])) {
+        echo json_encode(['success' => false, 'message' => 'Email already exists']);
+        exit;
+    }
+    
+    $uuid = generateUUID();
+    $studentIdNum = 'STU' . date('Y') . str_pad($db->count('students', '1=1') + 1, 4, '0', STR_PAD_LEFT);
+    $passwordHash = password_hash($_POST['password'] ?? 'student123', PASSWORD_DEFAULT);
+    
+    $profileImagePath = null;
+    if (isset($_FILES['profile_image']) && $_FILES['profile_image']['error'] === 0) {
+        $uploadDir = __DIR__ . '/../uploads/profiles/';
+        if (!is_dir($uploadDir)) {
+            mkdir($uploadDir, 0755, true);
+        }
+        $extension = pathinfo($_FILES['profile_image']['name'], PATHINFO_EXTENSION);
+        $filename = 'student_' . time() . '.' . $extension;
+        $targetPath = $uploadDir . $filename;
+        if (move_uploaded_file($_FILES['profile_image']['tmp_name'], $targetPath)) {
+            $profileImagePath = 'uploads/profiles/' . $filename;
+        }
+    }
+    
+    $userData = [
+        'uuid' => $uuid,
+        'email' => $_POST['email'],
+        'password_hash' => $passwordHash,
+        'role' => 'student',
+        'first_name' => $_POST['first_name'],
+        'last_name' => $_POST['last_name'],
+        'phone' => $_POST['phone'] ?? null,
+        'sync_status' => 'pending'
+    ];
+    
+    if ($profileImagePath) {
+        $userData['profile_image'] = $profileImagePath;
+    }
+    
+    $userId = $db->insert('users', $userData);
+    
+    if ($userId) {
+        $tags = json_encode(array_filter([$_POST['tag_high_performer'] ?? '', $_POST['tag_at_risk'] ?? '']));
+        
+        $db->insert('students', [
+            'uuid' => generateUUID(),
+            'user_id' => $userId,
+            'student_id' => $studentIdNum,
+            'admission_date' => $_POST['admission_date'] ?? date('Y-m-d'),
+            'date_of_birth' => $_POST['date_of_birth'] ?? date('Y-m-d'),
+            'gender' => $_POST['gender'] ?? 'male',
+            'blood_group' => $_POST['blood_group'] ?? null,
+            'nationality' => $_POST['nationality'] ?? null,
+            'address' => $_POST['address'] ?? null,
+            'tags' => $tags,
+            'risk_level' => $_POST['risk_level'] ?? 'low',
+            'guardian_id' => $_POST['guardian_id'] ?? null,
+            'class_id' => $_POST['class_id'] ?? null,
+            'sync_status' => 'pending'
+        ]);
+        echo json_encode(['success' => true, 'message' => 'Student created successfully']);
+    } else {
+        echo json_encode(['success' => false, 'message' => 'Failed to create student']);
+    }
+    exit;
+}
+
+// Update Student
+if ($endpoint === 'update_student' && $method === 'POST') {
+    $studentId = (int)($_POST['id'] ?? 0);
+    
+    if (!$studentId) {
+        echo json_encode(['success' => false, 'message' => 'Invalid student ID']);
+        exit;
+    }
+    
+    $student = $db->selectOne("SELECT user_id FROM students WHERE id = ?", [$studentId]);
+    
+    if (!$student) {
+        echo json_encode(['success' => false, 'message' => 'Student not found']);
+        exit;
+    }
+    
+    $profileImagePath = null;
+    
+    if (isset($_FILES['profile_image']) && $_FILES['profile_image']['error'] === 0) {
+        $uploadDir = __DIR__ . '/../uploads/profiles/';
+        if (!is_dir($uploadDir)) {
+            mkdir($uploadDir, 0755, true);
+        }
+        $extension = pathinfo($_FILES['profile_image']['name'], PATHINFO_EXTENSION);
+        $filename = 'student_' . $student['user_id'] . '_' . time() . '.' . $extension;
+        $targetPath = $uploadDir . $filename;
+        if (move_uploaded_file($_FILES['profile_image']['tmp_name'], $targetPath)) {
+            $profileImagePath = 'uploads/profiles/' . $filename;
+        }
+    }
+    
+    $userData = [
+        'first_name' => $_POST['first_name'] ?? '',
+        'last_name' => $_POST['last_name'] ?? '',
+        'email' => $_POST['email'] ?? '',
+        'phone' => $_POST['phone'] ?? null,
+        'sync_status' => 'pending'
+    ];
+    
+    if ($profileImagePath) {
+        $userData['profile_image'] = $profileImagePath;
+    }
+    
+    $db->update('users', $userData, 'id = :id', ['id' => $student['user_id']]);
+    
+    $tags = json_encode(array_filter([$_POST['tag_high_performer'] ?? '', $_POST['tag_at_risk'] ?? '']));
+    
+    $db->update('students', [
+        'gender' => $_POST['gender'] ?? 'male',
+        'date_of_birth' => $_POST['date_of_birth'] ?? null,
+        'blood_group' => $_POST['blood_group'] ?? null,
+        'nationality' => $_POST['nationality'] ?? null,
+        'address' => $_POST['address'] ?? null,
+        'tags' => $tags,
+        'risk_level' => $_POST['risk_level'] ?? 'low',
+        'guardian_id' => $_POST['guardian_id'] ?? null,
+        'class_id' => $_POST['class_id'] ?? null,
+        'sync_status' => 'pending'
+    ], 'id = :id', ['id' => $studentId]);
+    
+    echo json_encode(['success' => true, 'message' => 'Student updated successfully']);
+}
+
+// Update Teacher
+if ($endpoint === 'update_teacher' && $method === 'POST') {
+    $teacherId = (int)($_POST['id'] ?? 0);
+    
+    if (!$teacherId) {
+        echo json_encode(['success' => false, 'message' => 'Invalid teacher ID']);
+        exit;
+    }
+    
+    $teacher = $db->selectOne("SELECT user_id FROM teachers WHERE id = ?", [$teacherId]);
+    
+    if (!$teacher) {
+        echo json_encode(['success' => false, 'message' => 'Teacher not found']);
+        exit;
+    }
+    
+    $profileImagePath = null;
+    
+    if (isset($_FILES['profile_image']) && $_FILES['profile_image']['error'] === 0) {
+        $uploadDir = __DIR__ . '/../uploads/profiles/';
+        if (!is_dir($uploadDir)) {
+            mkdir($uploadDir, 0755, true);
+        }
+        
+        $allowedTypes = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
+        $fileType = $_FILES['profile_image']['type'];
+        
+        if (!in_array($fileType, $allowedTypes)) {
+            echo json_encode(['success' => false, 'message' => 'Invalid file type. Only JPEG, PNG, GIF, and WebP allowed.']);
+            exit;
+        }
+        
+        $extension = pathinfo($_FILES['profile_image']['name'], PATHINFO_EXTENSION);
+        $filename = 'teacher_' . $teacher['user_id'] . '_' . time() . '.' . $extension;
+        $targetPath = $uploadDir . $filename;
+        
+        if (move_uploaded_file($_FILES['profile_image']['tmp_name'], $targetPath)) {
+            $profileImagePath = 'uploads/profiles/' . $filename;
+        }
+    }
+    
+    $userData = [
+        'first_name' => $_POST['first_name'] ?? '',
+        'last_name' => $_POST['last_name'] ?? '',
+        'email' => $_POST['email'] ?? '',
+        'phone' => $_POST['phone'] ?? null,
+        'sync_status' => 'pending'
+    ];
+    
+    if ($profileImagePath) {
+        $userData['profile_image'] = $profileImagePath;
+    }
+    
+    $db->update('users', $userData, 'id = :id', ['id' => $teacher['user_id']]);
+    
+    $db->update('teachers', [
+        'department' => $_POST['department'] ?? '',
+        'qualification' => $_POST['qualification'] ?? '',
+        'hire_date' => $_POST['hire_date'] ?? null,
+        'sync_status' => 'pending'
+    ], 'id = :id', ['id' => $teacherId]);
+    
+    echo json_encode(['success' => true, 'message' => 'Teacher updated successfully']);
+}
